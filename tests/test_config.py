@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from nostalgiabox.config import (
@@ -200,3 +202,156 @@ def test_relative_paths_resolved_against_config_dir(tmp_path):
     cfg_file.write_text("channels:\n  - path: arthur\n    name: Arthur\n")
     cfg = load_config(cfg_file)
     assert cfg.channels[0].path == tmp_path / "arthur"
+
+
+def test_dtg_feature_defaults_are_off(tmp_path):
+    make_show(tmp_path, "arthur", 1)
+    cfg = config_from_dict({"channels": [{"path": str(tmp_path / "arthur")}]})
+
+    assert cfg.commercials.enabled is False
+    assert cfg.commercials.path is None
+    assert cfg.commercials.every == 1
+    assert cfg.commercials.count == (1, 3)
+    assert cfg.channels[0].commercials is True
+    assert cfg.network_bug.enabled is False
+    assert cfg.network_bug.text == "DTG"
+    assert cfg.network_bug.image is None
+    assert cfg.network_bug.corner == "bottom-right"
+    assert cfg.network_bug.opacity == 0.75
+    assert cfg.static_audio is False
+    assert cfg.state_dir == Path.home() / ".local" / "state" / "nostalgiabox"
+
+
+def test_dtg_feature_overrides_and_relative_paths(tmp_path):
+    make_show(tmp_path, "arthur", 1)
+    cfg = config_from_dict(
+        {
+            "channels": [{"path": "arthur", "commercials": False}],
+            "commercials": {
+                "enabled": True,
+                "path": "commercials",
+                "every": 2,
+                "count": [2, 4],
+            },
+            "network_bug": {
+                "enabled": True,
+                "text": "DTG 90",
+                "image": "art/bug.png",
+                "corner": "TOP-LEFT",
+                "opacity": 0.5,
+            },
+            "static_audio": True,
+            "state_dir": "state",
+        },
+        base_dir=tmp_path,
+    )
+
+    assert cfg.channels[0].commercials is False
+    assert cfg.commercials.enabled is True
+    assert cfg.commercials.path == tmp_path / "commercials"
+    assert cfg.commercials.every == 2
+    assert cfg.commercials.count == (2, 4)
+    assert cfg.network_bug.enabled is True
+    assert cfg.network_bug.text == "DTG 90"
+    assert cfg.network_bug.image == tmp_path / "art" / "bug.png"
+    assert cfg.network_bug.corner == "top-left"
+    assert cfg.network_bug.opacity == 0.5
+    assert cfg.static_audio is True
+    assert cfg.state_dir == tmp_path / "state"
+
+
+@pytest.mark.parametrize(
+    ("raw_count", "expected"),
+    [
+        (2, (2, 2)),
+        ([1, 3], (1, 3)),
+        ((4, 6), (4, 6)),
+    ],
+)
+def test_commercial_count_forms(tmp_path, raw_count, expected):
+    make_show(tmp_path, "arthur", 1)
+    cfg = config_from_dict(
+        {
+            "channels": [{"path": str(tmp_path / "arthur")}],
+            "commercials": {"count": raw_count},
+        }
+    )
+    assert cfg.commercials.count == expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        ({"commercials": []}, "commercials.*mapping"),
+        ({"commercials": {"enabled": "false"}}, "commercials.enabled"),
+        ({"commercials": {"path": 123}}, "commercials.path"),
+        ({"commercials": {"every": 0}}, "commercials.every"),
+        ({"commercials": {"every": True}}, "commercials.every"),
+        ({"commercials": {"count": []}}, "commercials.count"),
+        ({"commercials": {"count": [0, 2]}}, "commercials.count"),
+        ({"commercials": {"count": [3, 1]}}, "commercials.count"),
+        ({"commercials": {"count": [1, 2.5]}}, "commercials.count"),
+        ({"network_bug": []}, "network_bug.*mapping"),
+        ({"network_bug": {"enabled": "true"}}, "network_bug.enabled"),
+        ({"network_bug": {"text": 90}}, "network_bug.text"),
+        ({"network_bug": {"image": 90}}, "network_bug.image"),
+        ({"network_bug": {"corner": "center"}}, "network_bug.corner"),
+        ({"network_bug": {"opacity": -0.1}}, "network_bug.opacity"),
+        ({"network_bug": {"opacity": 1.1}}, "network_bug.opacity"),
+        ({"network_bug": {"opacity": "0.5"}}, "network_bug.opacity"),
+        ({"static_audio": "false"}, "static_audio"),
+        ({"state_dir": 123}, "state_dir"),
+    ],
+)
+def test_bad_dtg_config_rejected_with_friendly_error(tmp_path, extra, match):
+    make_show(tmp_path, "arthur", 1)
+    data = {"channels": [{"path": str(tmp_path / "arthur")}]}
+    data.update(extra)
+    with pytest.raises(ConfigError, match=match):
+        config_from_dict(data)
+
+
+def test_bad_channel_commercials_flag_rejected(tmp_path):
+    make_show(tmp_path, "arthur", 1)
+    with pytest.raises(ConfigError, match=r"channels\[0\]\.commercials"):
+        config_from_dict(
+            {
+                "channels": [
+                    {"path": str(tmp_path / "arthur"), "commercials": "false"}
+                ]
+            }
+        )
+
+
+def test_enabled_network_bug_requires_text_in_text_only_release(tmp_path):
+    make_show(tmp_path, "arthur", 1)
+    base = {"channels": [{"path": str(tmp_path / "arthur")}]}
+
+    with pytest.raises(ConfigError, match="network_bug.text.*non-empty"):
+        config_from_dict(
+            {
+                **base,
+                "network_bug": {"enabled": True, "text": "   ", "image": None},
+            }
+        )
+
+    with pytest.raises(ConfigError, match="PNG image rendering is not available"):
+        config_from_dict(
+            {
+                **base,
+                "network_bug": {"enabled": True, "text": "", "image": "bug.png"},
+            },
+            base_dir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("raw_state_dir", [None])
+def test_null_state_dir_uses_default(tmp_path, raw_state_dir):
+    make_show(tmp_path, "arthur", 1)
+    cfg = config_from_dict(
+        {
+            "channels": [{"path": str(tmp_path / "arthur")}],
+            "state_dir": raw_state_dir,
+        }
+    )
+    assert cfg.state_dir == Path.home() / ".local" / "state" / "nostalgiabox"

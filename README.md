@@ -1,5 +1,41 @@
 # NostalgiaBox
 
+## DTG Edition
+
+This is the **DTG Edition** fork of NostalgiaBox. It builds on the original
+MIT-licensed project by [Landon Bytheway](https://github.com/landonbtw/NostalgiaBox),
+with all DTG features opt-in so an upstream-style configuration keeps the
+original behavior.
+
+DTG configuration additions:
+
+| Key | Default | What it controls |
+|-----|---------|------------------|
+| `commercials.enabled` | `false` | Globally enables commercial breaks between episodes. |
+| `commercials.path` | `null` | Folder of commercial clips, scanned with the configured `video_extensions`. Relative paths are resolved from the config file. |
+| `commercials.every` | `1` | Plays a break after every N episodes; must be at least 1. |
+| `commercials.count` | `[1, 3]` | Ads per break, as a fixed integer or inclusive `[min, max]` range. |
+| `channels[].commercials` | `true` | Set to `false` on an individual channel to opt it out when commercials are globally enabled. |
+| `network_bug.enabled` | `false` | Shows a persistent network identifier over playback. |
+| `network_bug.text` | `"DTG"` | Text used for the network bug. |
+| `network_bug.image` | `null` | Optional PNG path reserved for image-bug support; leave `null` to use the text bug. Relative paths resolve from the config file. |
+| `network_bug.corner` | `bottom-right` | One of `top-left`, `top-right`, `bottom-left`, or `bottom-right`. |
+| `network_bug.opacity` | `0.75` | Bug opacity from `0.0` (transparent) to `1.0` (opaque). |
+| `static_audio` | `false` | Adds analog hiss to generated static/glitch transition clips. |
+| `state_dir` | `~/.local/state/nostalgiabox` | Stores resume positions when `tune_in: resume`; it is otherwise inert. A relative path resolves from the config file. |
+
+This release ships the text network bug. PNG rendering is deferred to the next
+DTG spec; `network_bug.image` is parsed now for forward-compatible configs but
+is not rendered yet. After changing `static_audio`, rebuild the cache-selected
+transition clips with `nostalgiabox --generate-assets --config config.yaml`.
+To exercise a configured two-ad break without hardware, run
+`nostalgiabox --dry-run --demo-ends 3 --config config.yaml`; it simulates one
+episode ending, both ads ending, then exits after the next episode starts.
+
+The shipped example also maps `KEY_ESC` to `none`, preventing a stray Escape
+press from quitting a living-room box. The `Q` key remains available to quit
+during development.
+
 **Turn a Raspberry Pi into a retro TV for your kids.**
 
 NostalgiaBox plays folders of old children's shows off an SD card as if they were
@@ -100,7 +136,7 @@ Install git (if needed), download the project, and run the installer:
 ```bash
 sudo apt update
 sudo apt install -y git
-git clone https://github.com/landonbtw/NostalgiaBox.git
+git clone --branch dtg-edition https://github.com/diggingthegreats-maker/NostalgiaBox.git
 cd NostalgiaBox
 ./scripts/install.sh
 ```
