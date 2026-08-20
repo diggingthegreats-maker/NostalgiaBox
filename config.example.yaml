@@ -32,6 +32,7 @@ channels:
   - number: 3
     name: "Arthur"
     path: /media/nostalgiabox/arthur
+    # commercials: false           # opt this channel out of commercial breaks
     # Leave out episodes you don't want on this channel:
     exclude_seasons: ["6-25"]      # drop seasons 6 through 25 (detected from
                                    #   names like S06E01, "Season 6", 6x01)
@@ -64,6 +65,32 @@ channels:
 tune_in: random
 
 start_channel: 2          # which channel the box powers on to
+
+# --- DTG Edition additions (all optional, all off by default) ----------------
+# Play commercial breaks between episodes. The folder is scanned recursively
+# using video_extensions. Per-channel `commercials: false` opts a channel out.
+# commercials:
+#   enabled: false
+#   path: /media/nostalgiabox/commercials
+#   every: 1              # play a break after every N episodes (minimum 1)
+#   count: [1, 3]         # fixed integer or inclusive [minimum, maximum] range
+
+# Show a persistent text network identifier during normal playback and ads.
+# PNG rendering is deferred to Spec 2; keep text non-empty and image null here.
+# network_bug:
+#   enabled: false
+#   text: "DTG"
+#   image: null
+#   corner: bottom-right  # top-left | top-right | bottom-left | bottom-right
+#   opacity: 0.75         # 0.0 (transparent) through 1.0 (opaque)
+
+# Add analog hiss to generated static/glitch transition clips. After changing
+# this, run: nostalgiabox --generate-assets --config config.yaml
+# static_audio: false
+
+# Resume positions use this folder only when tune_in is `resume`. Null/omitted
+# resolves to ~/.local/state/nostalgiabox; relative paths use the config folder.
+# state_dir: null
 
 # --- The "feel" of the TV ----------------------------------------------------
 # Shows keep their own aspect ratio (4:3 is pillar-boxed, 16:9 fills the screen)
@@ -137,13 +164,13 @@ input:
   # Map specific keys to actions (handy for odd remotes). Find a button's key
   # name with `sudo evtest`. Actions: channel_up, channel_down, volume_up,
   # volume_down, mute, enter, info, last_channel, power, quit, digit_0..digit_9,
-  # or none (to unbind). Example for a Logitech R400 presenter. NOTE: its
-  # play-screen button sends Escape (the quit key!), so remap KEY_ESC too or it
-  # will shut the box off.
-  # key_overrides:
-  #   KEY_PAGEUP: channel_down    # left  (<) arrow
-  #   KEY_PAGEDOWN: channel_up    # right (>) arrow
-  #   KEY_ESC: volume_down        # play-screen button (sends Esc)
-  #   KEY_F5: volume_down         #   ...and sometimes F5 - map both
-  #   KEY_DOT: volume_up          # blank-screen button
-  #   KEY_B: volume_up            #   ...blank button alt code - map both
+  # or none (to unbind). Escape normally quits, so the shipped config ignores
+  # it to prevent an accidental key press from stopping the TV. Q still quits
+  # for development. Add remote-specific mappings below as needed.
+  key_overrides:
+    KEY_ESC: none                 # living-room guard: ignore Escape
+    # KEY_PAGEUP: channel_down    # Logitech R400 left  (<) arrow
+    # KEY_PAGEDOWN: channel_up    # Logitech R400 right (>) arrow
+    # KEY_F5: volume_down         # play-screen button
+    # KEY_DOT: volume_up          # blank-screen button
+    # KEY_B: volume_up            # blank button alternate code

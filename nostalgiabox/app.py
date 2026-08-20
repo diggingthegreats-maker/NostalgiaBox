@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import logging
 import queue
+import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from .actions import Action, InputEvent
 from .channel import Channel, ChannelLineup, PlayRequest, build_lineup
@@ -27,11 +28,12 @@ from .config import Config
 from .input.manager import InputManager, create_backends
 from .overlay import OverlayManager
 from .player import END_EOF, END_ERROR, MockPlayer, Player
+from .state import ResumeEntry, ResumeStateStore
 from .static_gen import (
     COLORBARS_FILENAME,
     DEFAULT_ASSETS_DIR,
-    GLITCH_FILENAME,
-    STATIC_FILENAME,
+    glitch_filename,
+    static_filename,
 )
 
 log = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ class TVApp:
         overlay: Optional[OverlayManager] = None,
         clock: Callable[[], float] = time.monotonic,
         assets_dir: Optional[Path] = None,
+        resume_store: Optional[ResumeStateStore] = None,
     ) -> None:
         self.config = config
         self.player = player
@@ -56,7 +59,17 @@ class TVApp:
         self.overlay = overlay or OverlayManager(player, config, clock=clock)
         self._clock = clock
 
+        self._resume_store: Optional[ResumeStateStore] = None
+        resume_state = None
+        if config.tune_in == "resume":
+            self._resume_store = resume_store or ResumeStateStore(
+                config.state_dir, clock=clock
+            )
+            resume_state = self._resume_store.load()
+
         self.lineup: ChannelLineup = build_lineup(config)
+        if resume_state is not None:
+            self._restore_resume_state(resume_state)
 
         # Runtime state.
         self.volume = config.initial_volume
@@ -64,6 +77,9 @@ class TVApp:
         self.standby = False
         self.powered_off = False
         self._playing_path: Optional[Path] = None
+        self._playing_is_commercial = False
+        self._playing_channel_number: Optional[int] = None
+        self._resume_capture_after = 0.0
         self._last_channel_number: Optional[int] = None
         self._running = False
 
@@ -77,6 +93,8 @@ class TVApp:
         # at the moment of the cut-over, not when the button is pressed.
         self._switch_deadline: Optional[float] = None
         self._pending_banner: Optional[tuple[int, str]] = None
+        self._pending_request: Optional[PlayRequest] = None
+        self._pending_channel_number: Optional[int] = None
 
         # Playback-finished events from the player (may arrive on any thread).
         self._ended: "queue.Queue[str]" = queue.Queue()
@@ -141,19 +159,36 @@ class TVApp:
 
     def run(self) -> None:
         """Run the blocking main loop until a QUIT action is received."""
-        self.start()
+        previous_sigterm = None
         self._running = True
-        log.info("NostalgiaBox is on the air. %d channels.", len(self.lineup))
         try:
+            # systemd stops the service with SIGTERM. Turn that into an orderly
+            # loop exit so the final resume position is atomically flushed.
+            previous_sigterm = signal.signal(signal.SIGTERM, self._handle_sigterm)
+        except (OSError, ValueError):  # not the main thread / unsupported host
+            pass
+        try:
+            self.start()
+            log.info("NostalgiaBox is on the air. %d channels.", len(self.lineup))
             while self._running:
                 self.step(block=True)
         except KeyboardInterrupt:  # pragma: no cover - interactive convenience
             log.info("interrupted; shutting down")
         finally:
+            if previous_sigterm is not None:
+                try:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                except (OSError, ValueError):
+                    pass
             self.shutdown()
+
+    def _handle_sigterm(self, _signum, _frame) -> None:
+        log.info("termination requested; shutting down")
+        self._running = False
 
     def shutdown(self) -> None:
         self._running = False
+        self._flush_resume_position()
         try:
             self.overlay.clear_all()
         except Exception:  # noqa: BLE001
@@ -183,6 +218,13 @@ class TVApp:
         if self._switch_deadline is not None and now >= self._switch_deadline:
             self._switch_deadline = None
             self.player.commit_switch()
+            if self._pending_request is not None:
+                self._playing_path = self._pending_request.path
+                self._playing_is_commercial = self._pending_request.is_commercial
+                self._playing_channel_number = self._pending_channel_number
+                self._resume_capture_after = now
+            self._pending_request = None
+            self._pending_channel_number = None
             # Flash the channel banner right as the picture actually changes.
             if self._pending_banner is not None:
                 self.overlay.show_channel_bug(*self._pending_banner)
@@ -272,16 +314,27 @@ class TVApp:
             self._show_no_signal(channel)
             return
 
+        self._show_network_bug()
+
         if not show_static:
             # Not a channel change (first tune / waking from standby): play now.
             self._switch_deadline = None
+            self._pending_request = None
+            self._pending_channel_number = None
             self.overlay.show_channel_bug(channel.number, channel.name)
             self._play_request(request)
         elif self._transition_path is not None:
             # Transition clip (glitch/static) + preloaded episode.
             self._switch_deadline = None
+            self._pending_request = None
+            self._pending_channel_number = None
             self.overlay.show_channel_bug(channel.number, channel.name)
             self._playing_path = request.path
+            self._playing_is_commercial = request.is_commercial
+            self._playing_channel_number = channel.number
+            # During the transition mpv is still showing the filler clip; do
+            # not save its time position under the target episode.
+            self._resume_capture_after = self._clock() + self.config.transition_duration
             self.player.play_transition(
                 self._transition_path,
                 request.path,
@@ -292,23 +345,37 @@ class TVApp:
             # No transition effect: keep the current show playing while the next
             # channel preloads, then cut over (no frozen frame). The banner is
             # shown at the cut-over (see _maybe_commit_switch), not right now.
-            self._playing_path = request.path
             self.player.preload_next(request.path, start=request.start)
             self._switch_deadline = self._clock() + self.config.bridge_seconds
             self._pending_banner = (channel.number, channel.name)
+            self._pending_request = request
+            self._pending_channel_number = channel.number
         else:
             self._switch_deadline = None
+            self._pending_request = None
+            self._pending_channel_number = None
             self.overlay.show_channel_bug(channel.number, channel.name)
             self._play_request(request)
 
     def _play_request(self, request: PlayRequest) -> None:
         self._playing_path = request.path
+        self._playing_is_commercial = request.is_commercial
+        self._playing_channel_number = self.lineup.current.number
+        self._resume_capture_after = self._clock()
+        if request.is_commercial:
+            log.info("commercial break: playing %s", request.path)
         self.player.play(request.path, start=request.start)
 
     def _show_no_signal(self, channel: Channel) -> None:
         self._switch_deadline = None
         self._pending_banner = None
+        self._pending_request = None
+        self._pending_channel_number = None
         self._playing_path = None
+        self._playing_is_commercial = False
+        self._playing_channel_number = None
+        if self.config.network_bug.enabled:
+            self.overlay.hide_bug()
         if self._colorbars_path is not None:
             self.player.play_loop(self._colorbars_path)
         else:
@@ -340,8 +407,13 @@ class TVApp:
         """Cleanly shut the Pi down so it's safe to unplug."""
         log.info("powering off (volume floor)")
         self.powered_off = True
+        # Capture state before player.stop() clears the time position and before
+        # the OS power-off command can terminate this process.
+        self._flush_resume_position()
         self._switch_deadline = None
         self._pending_banner = None
+        self._pending_request = None
+        self._pending_channel_number = None
         try:
             self.overlay.clear_all()
             self.overlay.show_message("GOODBYE", duration=0)
@@ -376,6 +448,8 @@ class TVApp:
             self._remember_position()
             self._switch_deadline = None
             self._pending_banner = None
+            self._pending_request = None
+            self._pending_channel_number = None
             self.player.stop()
             self.overlay.clear_all()
             self.overlay.show_standby()
@@ -403,16 +477,20 @@ class TVApp:
 
     # -- playback-finished handling ----------------------------------------
     def _drain_playback_events(self) -> None:
-        advanced = False
+        # Snapshot the events that existed before advancing. A failed play can
+        # synchronously queue END_ERROR; leaving that new event for the next
+        # loop iteration prevents it from being coalesced away and freezing TV.
+        reasons = []
         while True:
             try:
-                reason = self._ended.get_nowait()
+                reasons.append(self._ended.get_nowait())
             except queue.Empty:
                 break
-            # Coalesce: only advance once even if several events queued up.
-            if reason in (END_EOF, END_ERROR) and not advanced and not self.standby:
-                self._advance_current()
-                advanced = True
+        if (
+            any(reason in (END_EOF, END_ERROR) for reason in reasons)
+            and not self.standby
+        ):
+            self._advance_current()
 
     def _advance_current(self) -> None:
         request = self.lineup.current.advance()
@@ -423,11 +501,58 @@ class TVApp:
 
     # -- helpers ------------------------------------------------------------
     def _remember_position(self) -> None:
-        if self.config.tune_in != "resume" or self._playing_path is None:
+        if (
+            self.config.tune_in != "resume"
+            or self._playing_path is None
+            or self._playing_is_commercial
+            or self._playing_channel_number is None
+            or self._clock() < self._resume_capture_after
+        ):
             return
         pos = self.player.get_time_pos()
         if pos is not None:
-            self.lineup.current.remember(self._playing_path, pos)
+            channel = next(
+                (
+                    item
+                    for item in self.lineup
+                    if item.number == self._playing_channel_number
+                ),
+                None,
+            )
+            if channel is None or self._playing_path not in channel.episodes:
+                return
+            channel.remember(self._playing_path, pos)
+            if self._resume_store is not None:
+                self._resume_store.remember(channel.number, self._playing_path, pos)
+
+    def _flush_resume_position(self) -> None:
+        """Capture and force-write resume state before a clean exit."""
+        self._remember_position()
+        if self._resume_store is not None:
+            self._resume_store.flush(force=True)
+
+    def _show_network_bug(self) -> None:
+        # Avoid even an extra overlay-clear command when the feature is off so
+        # the default playback path remains identical to upstream.
+        if self.config.network_bug.enabled:
+            self.overlay.show_bug()
+
+    def _restore_resume_state(self, resume_state: Mapping[int, ResumeEntry]) -> None:
+        """Apply valid saved positions as the lineup is initialized."""
+        for channel in self.lineup:
+            entry = resume_state.get(channel.number)
+            if entry is None:
+                continue
+            # A removed/moved episode must never strand the channel on a stale
+            # path; simply fall back to its normal tune-in selection.
+            if entry.path in channel.episodes and entry.path.is_file():
+                channel.remember(entry.path, entry.position)
+            else:
+                log.info(
+                    "ignoring stale resume entry for channel %s: %s",
+                    channel.number,
+                    entry.path,
+                )
 
     def _select_start_channel(self) -> None:
         if self.config.start_channel is not None and self.lineup.has_number(
@@ -443,14 +568,34 @@ class TVApp:
         effect = self.config.transition_effect
         if effect == "none":
             return None
-        filename = GLITCH_FILENAME if effect == "glitch" else STATIC_FILENAME
+        filename = (
+            glitch_filename(self.config.static_audio)
+            if effect == "glitch"
+            else static_filename(self.config.static_audio)
+        )
         return self._resolve_asset(filename)
 
 
-def run_from_config(config: Config, *, dry_run: bool = False) -> None:
+def run_from_config(
+    config: Config,
+    *,
+    dry_run: bool = False,
+    demo_ends: int = 0,
+) -> None:
     """Convenience entry point used by the CLI."""
     app = TVApp.from_config(config, dry_run=dry_run)
-    app.run()
+    if demo_ends:
+        if not dry_run or not isinstance(app.player, MockPlayer):
+            raise RuntimeError("demo playback endings require --dry-run")
+        app.start()
+        try:
+            for _ in range(demo_ends):
+                app.player.finish_current(END_EOF)
+                app._drain_playback_events()
+        finally:
+            app.shutdown()
+    else:
+        app.run()
 
 
 __all__ = ["TVApp", "run_from_config"]

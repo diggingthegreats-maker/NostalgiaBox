@@ -19,7 +19,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AbstractSet, Dict, List, Optional, Sequence
+from typing import AbstractSet, Dict, List, Optional, Sequence, Union
 
 # Patterns for pulling a season number out of a file/folder path.
 _SEASON_PATTERNS = (
@@ -41,6 +41,7 @@ class PlayRequest:
 
     path: Path
     start: float = 0.0
+    is_commercial: bool = False
 
 
 def detect_season(text: str) -> Optional[int]:
@@ -160,6 +161,10 @@ class Channel:
         start_offset_min: float = 0.0,
         start_offset_max: Optional[float] = None,
         rng: Optional[random.Random] = None,
+        commercial_bag: Optional[ShuffleBag[Path]] = None,
+        commercial_every: int = 1,
+        commercial_count: Union[int, Sequence[int]] = 1,
+        commercial_rng: Optional[random.Random] = None,
     ) -> None:
         self.config = config
         self.episodes: List[Path] = list(episodes)
@@ -182,6 +187,21 @@ class Channel:
         self._resume_position: float = 0.0
         # Broadcast schedule (built lazily on first use in "broadcast" mode).
         self._broadcast: Optional[BroadcastSchedule] = None
+        self._commercial_bag = (
+            commercial_bag
+            if commercial_bag is not None
+            and getattr(config, "commercials", True)
+            else None
+        )
+        self._commercial_every = max(1, int(commercial_every))
+        self._commercial_count_min, self._commercial_count_max = (
+            self._normalise_commercial_count(commercial_count)
+        )
+        self._commercial_rng = commercial_rng or self._rng
+        self._episodes_since_commercial = 0
+        self._pending_commercials = 0
+        self._commercial_break_active = False
+        self._playing_commercial = False
 
     # -- identity -----------------------------------------------------------
     @property
@@ -206,10 +226,68 @@ class Channel:
             start = self._rng.uniform(self.start_offset_min, self.start_offset_max)
         else:
             start = self.start_offset_min
+        self._playing_commercial = False
         return PlayRequest(path=self._bag.next(), start=start)
+
+    def _next_episode(self) -> PlayRequest:
+        """Return the next show request for this channel's tune-in mode."""
+        if self.tune_in_mode == "broadcast" and self._broadcast is not None:
+            # The wall-clock schedule keeps advancing while ads play, so after
+            # the break we land wherever the station timeline is now.
+            self._playing_commercial = False
+            return self._broadcast.at(time.time())
+        return self._next_shuffled()
+
+    @staticmethod
+    def _normalise_commercial_count(
+        count: Union[int, Sequence[int]],
+    ) -> tuple[int, int]:
+        """Return an inclusive ``(minimum, maximum)`` commercial count range.
+
+        Config validation normally supplies a two-item tuple. Accepting a
+        fixed integer here keeps :class:`Channel` convenient to construct in
+        isolation and mirrors the public YAML surface.
+        """
+        if isinstance(count, int):
+            lo = hi = count
+        else:
+            values = list(count)
+            if not values:
+                lo = hi = 1
+            elif len(values) == 1:
+                lo = hi = int(values[0])
+            else:
+                lo, hi = int(values[0]), int(values[1])
+        lo = max(1, lo)
+        return lo, max(lo, hi)
+
+    def _begin_commercial_break(self) -> PlayRequest:
+        """Queue and return the first clip in a newly due commercial break."""
+        assert self._commercial_bag is not None
+        count = self._commercial_rng.randint(
+            self._commercial_count_min, self._commercial_count_max
+        )
+        # Draw lazily as each ad is requested. If the viewer flips away during
+        # the break, unseen clips remain in the global shuffle bag.
+        self._pending_commercials = count
+        self._commercial_break_active = True
+        return self._next_commercial()
+
+    def _next_commercial(self) -> PlayRequest:
+        assert self._commercial_bag is not None
+        assert self._pending_commercials > 0
+        path = self._commercial_bag.next()
+        self._pending_commercials -= 1
+        self._playing_commercial = True
+        return PlayRequest(path=path, start=0.0, is_commercial=True)
 
     def tune_in(self, *, now: Optional[float] = None) -> Optional[PlayRequest]:
         """Decide what to play the instant a viewer switches to this channel."""
+        # A channel change always lands in a show. If the viewer left this
+        # channel during an ad break, abandon the rest of that break.
+        self._pending_commercials = 0
+        self._commercial_break_active = False
+        self._playing_commercial = False
         if self.is_empty:
             return None
         now = time.time() if now is None else now
@@ -229,13 +307,26 @@ class Channel:
         """Decide what to play when the current episode ends naturally."""
         if self.is_empty:
             return None
-        if self.tune_in_mode == "broadcast" and self._broadcast is not None:
-            # Roll straight into whatever airs next in the running order.
-            return self._broadcast.at(time.time())
-        return self._next_shuffled()
+
+        if self._commercial_break_active:
+            if self._pending_commercials:
+                return self._next_commercial()
+            # The final ad just ended. Return to the episode shuffle without
+            # treating that ad as another completed episode.
+            self._commercial_break_active = False
+            return self._next_episode()
+
+        if self._commercial_bag is not None:
+            self._episodes_since_commercial += 1
+            if self._episodes_since_commercial >= self._commercial_every:
+                self._episodes_since_commercial = 0
+                return self._begin_commercial_break()
+        return self._next_episode()
 
     def remember(self, path: Path, position: float) -> None:
         """Record where the viewer left off (for the "resume" mode)."""
+        if self._playing_commercial:
+            return
         self._resume_path = path
         self._resume_position = max(0.0, position)
 
@@ -311,9 +402,37 @@ class ChannelLineup:
         return self.current
 
 
-def build_lineup(config: Config, *, rng: Optional[random.Random] = None) -> ChannelLineup:
+def build_lineup(
+    config: Config,
+    *,
+    rng: Optional[random.Random] = None,
+) -> ChannelLineup:
     """Scan every configured channel folder and build the full lineup."""
     base_rng = rng or random.Random(config.shuffle_seed)
+    commercial_bag: Optional[ShuffleBag[Path]] = None
+    commercials = getattr(config, "commercials", None)
+    if commercials is not None and commercials.enabled:
+        if commercials.path is None:
+            log.warning(
+                "commercials are enabled but no commercials path is configured; "
+                "commercial breaks are disabled"
+            )
+        else:
+            commercial_paths = scan_episodes(
+                commercials.path,
+                config.video_extensions,
+                recursive=True,
+            )
+            if commercial_paths:
+                # All channels draw from this one bag, so every commercial in
+                # the station-wide pool airs before the pool reshuffles.
+                commercial_bag = ShuffleBag(commercial_paths, base_rng)
+            else:
+                log.warning(
+                    "commercials are enabled but no playable clips were found in %s; "
+                    "commercial breaks are disabled",
+                    commercials.path,
+                )
     channels: List[Channel] = []
     for i, ch_cfg in enumerate(config.channels):
         episodes = scan_episodes(
@@ -335,16 +454,19 @@ def build_lineup(config: Config, *, rng: Optional[random.Random] = None) -> Chan
             ch_rng = random.Random(hash((config.shuffle_seed, ch_cfg.number, i)) & 0xFFFFFFFF)
         else:
             ch_rng = random.Random()
-        channels.append(
-            Channel(
-                ch_cfg,
-                episodes,
-                tune_in=config.tune_in,
-                start_offset_min=config.start_offset_min,
-                start_offset_max=config.start_offset_max,
-                rng=ch_rng,
-            )
+        channel = Channel(
+            ch_cfg,
+            episodes,
+            tune_in=config.tune_in,
+            start_offset_min=config.start_offset_min,
+            start_offset_max=config.start_offset_max,
+            rng=ch_rng,
+            commercial_bag=commercial_bag,
+            commercial_every=(commercials.every if commercials is not None else 1),
+            commercial_count=(commercials.count if commercials is not None else 1),
+            commercial_rng=base_rng,
         )
+        channels.append(channel)
     return ChannelLineup(channels)
 
 

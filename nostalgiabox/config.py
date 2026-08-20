@@ -42,6 +42,9 @@ TUNE_IN_MODES = ("random", "resume", "broadcast")
 #   none   - cut straight to the next channel
 TRANSITION_EFFECTS = ("glitch", "static", "none")
 
+# Corners available for the persistent DTG network identifier.
+NETWORK_BUG_CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+
 
 @dataclass(frozen=True)
 class UiConfig:
@@ -66,6 +69,28 @@ class CrtConfig:
 
 
 @dataclass(frozen=True)
+class CommercialsConfig:
+    """Optional commercial-break settings (disabled by default)."""
+
+    enabled: bool = False
+    path: Optional[Path] = None
+    every: int = 1
+    # Always normalised to an inclusive ``(minimum, maximum)`` range.
+    count: tuple[int, int] = (1, 3)
+
+
+@dataclass(frozen=True)
+class NetworkBugConfig:
+    """Optional persistent network identifier (disabled by default)."""
+
+    enabled: bool = False
+    text: str = "DTG"
+    image: Optional[Path] = None
+    corner: str = "bottom-right"
+    opacity: float = 0.75
+
+
+@dataclass(frozen=True)
 class ChannelConfig:
     """A single television channel backed by a folder of episodes."""
 
@@ -78,6 +103,8 @@ class ChannelConfig:
     # a set of season numbers detected from the path (e.g. S06E01, "Season 6").
     exclude: tuple[str, ...] = ()
     exclude_seasons: frozenset[int] = frozenset()
+    # Per-channel opt-out. The global commercials switch remains off by default.
+    commercials: bool = True
 
     def __post_init__(self) -> None:
         if self.number < 0:
@@ -113,6 +140,16 @@ class Config:
     ui: UiConfig = field(default_factory=UiConfig)
     crt: CrtConfig = field(default_factory=CrtConfig)
 
+    # DTG Edition additions. Feature switches stay off unless explicitly set.
+    commercials: CommercialsConfig = field(default_factory=CommercialsConfig)
+    network_bug: NetworkBugConfig = field(default_factory=NetworkBugConfig)
+    static_audio: bool = False
+
+    # Resume persistence is only used in ``resume`` tune-in mode.
+    state_dir: Path = field(
+        default_factory=lambda: Path("~/.local/state/nostalgiabox").expanduser()
+    )
+
     # Audio.
     initial_volume: int = 70              # 0-100
     volume_step: int = 5
@@ -144,6 +181,24 @@ def _as_path(value: Any, base: Optional[Path]) -> Path:
     if not p.is_absolute() and base is not None:
         p = (base / p)
     return p
+
+
+def _optional_path(value: Any, base: Optional[Path], name: str) -> Optional[Path]:
+    if value is None:
+        return None
+    if not isinstance(value, (str, os.PathLike)):
+        raise ConfigError(f"'{name}' must be a path string or null")
+    raw_path = os.fspath(value)
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ConfigError(f"'{name}' must be a non-empty path string or null")
+    return _as_path(raw_path, base)
+
+
+def _required_path(value: Any, base: Optional[Path], name: str) -> Path:
+    path = _optional_path(value, base, name)
+    if path is None:
+        raise ConfigError(f"'{name}' must be a non-empty path string")
+    return path
 
 
 def _discover_channels(
@@ -205,6 +260,9 @@ def _parse_channels(raw: Any, base: Optional[Path], default_shuffle: bool) -> Li
                 shuffle=bool(entry.get("shuffle", default_shuffle)),
                 exclude=_parse_str_list(entry.get("exclude"), "exclude"),
                 exclude_seasons=_parse_seasons(entry.get("exclude_seasons")),
+                commercials=_strict_bool(
+                    entry.get("commercials", True), f"channels[{i}].commercials"
+                ),
             )
         )
     return channels
@@ -289,6 +347,12 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
     assets_dir_raw = data.get("assets_dir")
     assets_dir = _as_path(assets_dir_raw, base_dir) if assets_dir_raw else None
 
+    state_dir_raw = data.get("state_dir")
+    if state_dir_raw is None:
+        state_dir = Path("~/.local/state/nostalgiabox").expanduser()
+    else:
+        state_dir = _required_path(state_dir_raw, base_dir, "state_dir")
+
     start_channel = data.get("start_channel")
     start_channel = int(start_channel) if start_channel is not None else None
 
@@ -320,6 +384,10 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
         osd_duration=_clamp_float(data.get("osd_duration", 2.0), 0.0, 60.0, "osd_duration"),
         ui=_parse_ui(data.get("ui")),
         crt=_parse_crt(data.get("crt")),
+        commercials=_parse_commercials(data.get("commercials"), base_dir),
+        network_bug=_parse_network_bug(data.get("network_bug"), base_dir),
+        static_audio=_strict_bool(data.get("static_audio", False), "static_audio"),
+        state_dir=state_dir,
         initial_volume=initial_volume,
         volume_step=volume_step,
         audio_device=audio_device,
@@ -380,6 +448,89 @@ def _parse_crt(raw: Any) -> CrtConfig:
     )
 
 
+def _parse_commercials(raw: Any, base: Optional[Path]) -> CommercialsConfig:
+    if raw is None:
+        return CommercialsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'commercials' must be a mapping")
+
+    defaults = CommercialsConfig()
+    path = _optional_path(raw.get("path"), base, "commercials.path")
+    every = _strict_int(raw.get("every", defaults.every), "commercials.every")
+    if every < 1:
+        raise ConfigError("'commercials.every' must be an integer >= 1")
+
+    return CommercialsConfig(
+        enabled=_strict_bool(raw.get("enabled", defaults.enabled), "commercials.enabled"),
+        path=path,
+        every=every,
+        count=_commercial_count(raw.get("count", defaults.count)),
+    )
+
+
+def _commercial_count(raw: Any) -> tuple[int, int]:
+    """Normalise a fixed count or inclusive ``[minimum, maximum]`` range."""
+    if type(raw) is int:
+        lo = hi = raw
+    elif isinstance(raw, (list, tuple)) and len(raw) == 2:
+        lo = _strict_int(raw[0], "commercials.count[0]")
+        hi = _strict_int(raw[1], "commercials.count[1]")
+    else:
+        raise ConfigError(
+            "'commercials.count' must be an integer or a two-item [min, max] list"
+        )
+
+    if lo < 1 or hi < 1:
+        raise ConfigError("'commercials.count' values must be integers >= 1")
+    if lo > hi:
+        raise ConfigError("'commercials.count' minimum must be <= maximum")
+    return (lo, hi)
+
+
+def _parse_network_bug(raw: Any, base: Optional[Path]) -> NetworkBugConfig:
+    if raw is None:
+        return NetworkBugConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'network_bug' must be a mapping")
+
+    defaults = NetworkBugConfig()
+    enabled = _strict_bool(raw.get("enabled", defaults.enabled), "network_bug.enabled")
+
+    text = raw.get("text", defaults.text)
+    if not isinstance(text, str):
+        raise ConfigError("'network_bug.text' must be a string")
+
+    image = _optional_path(raw.get("image"), base, "network_bug.image")
+
+    corner = raw.get("corner", defaults.corner)
+    if not isinstance(corner, str):
+        raise ConfigError(
+            f"'network_bug.corner' must be one of {NETWORK_BUG_CORNERS}"
+        )
+    corner = corner.strip().lower()
+    if corner not in NETWORK_BUG_CORNERS:
+        raise ConfigError(
+            f"'network_bug.corner' must be one of {NETWORK_BUG_CORNERS}, got '{corner}'"
+        )
+
+    opacity = _bounded_float(
+        raw.get("opacity", defaults.opacity), 0.0, 1.0, "network_bug.opacity"
+    )
+    if enabled and not text.strip():
+        raise ConfigError(
+            "'network_bug.text' must be non-empty when the network bug is enabled "
+            "(PNG image rendering is not available in this release)"
+        )
+
+    return NetworkBugConfig(
+        enabled=enabled,
+        text=text,
+        image=image,
+        corner=corner,
+        opacity=opacity,
+    )
+
+
 def _offset_range(data: Dict[str, Any]) -> tuple[float, float]:
     """Resolve the (min, max) start-offset seconds from the config.
 
@@ -429,6 +580,29 @@ def _ensure_unique_numbers(channels: List[ChannelConfig]) -> None:
         seen[ch.number] = ch.name
 
 
+def _strict_bool(value: Any, name: str) -> bool:
+    if type(value) is not bool:
+        raise ConfigError(f"'{name}' must be true or false")
+    return value
+
+
+def _strict_int(value: Any, name: str) -> int:
+    if type(value) is not int:
+        raise ConfigError(f"'{name}' must be an integer")
+    return value
+
+
+def _bounded_float(value: Any, lo: float, hi: float, name: str) -> float:
+    import math
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"'{name}' must be a number between {lo} and {hi}")
+    n = float(value)
+    if not math.isfinite(n) or not lo <= n <= hi:
+        raise ConfigError(f"'{name}' must be between {lo} and {hi}, got {value}")
+    return n
+
+
 def _clamp_int(value: Any, lo: int, hi: int, name: str) -> int:
     try:
         n = int(value)
@@ -450,10 +624,13 @@ __all__ = [
     "ChannelConfig",
     "UiConfig",
     "CrtConfig",
+    "CommercialsConfig",
+    "NetworkBugConfig",
     "ConfigError",
     "load_config",
     "config_from_dict",
     "DEFAULT_VIDEO_EXTENSIONS",
     "TUNE_IN_MODES",
     "TRANSITION_EFFECTS",
+    "NETWORK_BUG_CORNERS",
 ]

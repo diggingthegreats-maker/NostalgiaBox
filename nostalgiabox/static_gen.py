@@ -2,8 +2,8 @@
 
 These short clips are what make channel changes feel like a real 2000s TV:
 
-* ``static.mp4`` - a second of silent grey "snow", shown briefly whenever the
-  channel changes.
+* ``static.mp4`` - a second of grey "snow", shown briefly whenever the channel
+  changes (silent by default, with optional analog hiss).
 * ``colorbars.mp4`` - SMPTE colour bars with a 1 kHz tone, shown at start-up and
   as a friendly "no signal" / empty-channel screen.
 
@@ -27,8 +27,20 @@ log = logging.getLogger(__name__)
 DEFAULT_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 STATIC_FILENAME = "static.mp4"
+STATIC_AUDIO_FILENAME = "static-audio.mp4"
 COLORBARS_FILENAME = "colorbars.mp4"
 GLITCH_FILENAME = "glitch.mp4"
+GLITCH_AUDIO_FILENAME = "glitch-audio.mp4"
+
+
+def static_filename(static_audio: bool = False) -> str:
+    """Return the cache-distinct static asset name for the selected audio mode."""
+    return STATIC_AUDIO_FILENAME if static_audio else STATIC_FILENAME
+
+
+def glitch_filename(static_audio: bool = False) -> str:
+    """Return the cache-distinct glitch asset name for the selected audio mode."""
+    return GLITCH_AUDIO_FILENAME if static_audio else GLITCH_FILENAME
 
 
 def ffmpeg_available() -> bool:
@@ -47,24 +59,41 @@ def generate_static(
     width: int = 1280,
     height: int = 720,
     fps: int = 25,
+    static_audio: bool = False,
 ) -> Path:
-    """Render a loopable, silent analog-snow clip to ``out_path``.
+    """Render a loopable analog-snow clip to ``out_path``.
 
     Only ~0.5s is shown per channel change, but we render a full second so the
-    brief loop never shows a visible seam. The clip has no audio track, so
-    channel changes are silent (no static hiss).
+    brief loop never shows a visible seam. Audio remains absent by default;
+    ``static_audio=True`` adds modest white-noise hiss.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", f"nullsrc=s={width}x{height}:r={fps}:d={duration}",
-        "-vf", "geq=lum='random(1)*255':cb=128:cr=128,format=yuv420p",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        # Silent: the snow is picture-only, no audio hiss.
-        "-an",
-        str(out_path),
-    ]
+    if static_audio:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"nullsrc=s={width}x{height}:r={fps}:d={duration}",
+            "-f", "lavfi",
+            "-i", f"anoisesrc=color=white:sample_rate=48000:duration={duration}",
+            "-vf", "geq=lum='random(1)*255':cb=128:cr=128,format=yuv420p",
+            "-af", "volume=-18dB",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k",
+            "-shortest",
+            str(out_path),
+        ]
+    else:
+        # Keep the original silent command byte-for-byte when the feature is off.
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"nullsrc=s={width}x{height}:r={fps}:d={duration}",
+            "-vf", "geq=lum='random(1)*255':cb=128:cr=128,format=yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            # Silent: the snow is picture-only, no audio hiss.
+            "-an",
+            str(out_path),
+        ]
     _run(cmd)
     return out_path
 
@@ -76,27 +105,48 @@ def generate_glitch(
     width: int = 1280,
     height: int = 720,
     fps: int = 25,
+    static_audio: bool = False,
 ) -> Path:
-    """Render a short, silent 'digital glitch' clip to ``out_path``.
+    """Render a short 'digital glitch' clip to ``out_path``.
 
     Chunky coloured blocks (small random frame scaled up with nearest-neighbour)
     read as corrupted video macroblocks - a brief digital glitch shown while the
     channel changes. Only a fraction is shown per change, but the CRT shader is
-    applied to it so it stays inside the tube frame.
+    applied to it so it stays inside the tube frame. It remains silent unless
+    ``static_audio`` is enabled, which adds a matching short noise burst.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", f"nullsrc=s=96x54:r={fps}:d={duration}",
-        "-vf", (
-            "geq=r='random(1)*255':g='random(2)*255':b='random(3)*255',"
-            f"scale={width}:{height}:flags=neighbor,format=yuv420p"
-        ),
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-an",
-        str(out_path),
-    ]
+    if static_audio:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"nullsrc=s=96x54:r={fps}:d={duration}",
+            "-f", "lavfi",
+            "-i", f"anoisesrc=color=white:sample_rate=48000:duration={duration}",
+            "-vf", (
+                "geq=r='random(1)*255':g='random(2)*255':b='random(3)*255',"
+                f"scale={width}:{height}:flags=neighbor,format=yuv420p"
+            ),
+            "-af", "volume=-18dB",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k",
+            "-shortest",
+            str(out_path),
+        ]
+    else:
+        # Keep the original silent command byte-for-byte when the feature is off.
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"nullsrc=s=96x54:r={fps}:d={duration}",
+            "-vf", (
+                "geq=r='random(1)*255':g='random(2)*255':b='random(3)*255',"
+                f"scale={width}:{height}:flags=neighbor,format=yuv420p"
+            ),
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-an",
+            str(out_path),
+        ]
     _run(cmd)
     return out_path
 
@@ -127,7 +177,12 @@ def generate_color_bars(
     return out_path
 
 
-def generate_all(assets_dir: Path, *, force: bool = False) -> List[Path]:
+def generate_all(
+    assets_dir: Path,
+    *,
+    force: bool = False,
+    static_audio: bool = False,
+) -> List[Path]:
     """Generate any missing assets in ``assets_dir``; return what exists."""
     if not ffmpeg_available():
         raise RuntimeError(
@@ -137,15 +192,15 @@ def generate_all(assets_dir: Path, *, force: bool = False) -> List[Path]:
     assets_dir.mkdir(parents=True, exist_ok=True)
     results: List[Path] = []
 
-    static_path = assets_dir / STATIC_FILENAME
+    static_path = assets_dir / static_filename(static_audio)
     if force or not static_path.exists():
-        results.append(generate_static(static_path))
+        results.append(generate_static(static_path, static_audio=static_audio))
     else:
         results.append(static_path)
 
-    glitch_path = assets_dir / GLITCH_FILENAME
+    glitch_path = assets_dir / glitch_filename(static_audio)
     if force or not glitch_path.exists():
-        results.append(generate_glitch(glitch_path))
+        results.append(generate_glitch(glitch_path, static_audio=static_audio))
     else:
         results.append(glitch_path)
 
@@ -167,11 +222,20 @@ def main(argv: List[str] | None = None) -> int:
         help=f"where to write the assets (default: {DEFAULT_ASSETS_DIR})",
     )
     parser.add_argument("--force", action="store_true", help="regenerate even if present")
+    parser.add_argument(
+        "--static-audio",
+        action="store_true",
+        help="add -18 dB white-noise hiss to static and glitch clips",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
-        produced = generate_all(args.assets_dir, force=args.force)
+        produced = generate_all(
+            args.assets_dir,
+            force=args.force,
+            static_audio=args.static_audio,
+        )
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         log.error("asset generation failed: %s", exc)
         return 1

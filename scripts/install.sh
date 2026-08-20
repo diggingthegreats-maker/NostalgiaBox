@@ -40,8 +40,14 @@ pip install --upgrade pip
 # needing to reinstall (just restart the service afterwards).
 pip install -e "${REPO_DIR}[pi]"
 
+if [[ ! -f "${REPO_DIR}/config.yaml" ]]; then
+  echo "==> Creating a starter config.yaml (edit it to point at your shows!)"
+  cp "${REPO_DIR}/config.example.yaml" "${REPO_DIR}/config.yaml"
+fi
+
 echo "==> Generating filler assets (static + colour bars)"
-python -m nostalgiabox.static_gen || echo "   (asset generation skipped/failed - box still works)"
+nostalgiabox --generate-assets --config "${REPO_DIR}/config.yaml" || \
+  echo "   (asset generation skipped/failed - box still works)"
 
 echo "==> Installing the retro OSD font (VT323)"
 # NostalgiaBox also copies this into mpv's font dir at runtime, but installing it
@@ -51,11 +57,6 @@ if compgen -G "${REPO_DIR}/nostalgiabox/assets/fonts/*.ttf" > /dev/null; then
   cp "${REPO_DIR}"/nostalgiabox/assets/fonts/*.ttf "${HOME}/.local/share/fonts/" || true
   cp "${REPO_DIR}"/nostalgiabox/assets/fonts/*.ttf "${HOME}/.config/mpv/fonts/" || true
   command -v fc-cache > /dev/null && fc-cache -f "${HOME}/.local/share/fonts" || true
-fi
-
-if [[ ! -f "${REPO_DIR}/config.yaml" ]]; then
-  echo "==> Creating a starter config.yaml (edit it to point at your shows!)"
-  cp "${REPO_DIR}/config.example.yaml" "${REPO_DIR}/config.yaml"
 fi
 
 echo "==> Validating configuration"

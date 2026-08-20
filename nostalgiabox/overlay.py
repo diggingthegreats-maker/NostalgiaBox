@@ -47,6 +47,7 @@ _ID_CHANNEL = 1
 _ID_VOLUME = 2
 _ID_STANDBY = 3
 _ID_MESSAGE = 4
+_ID_BUG = 5
 
 _BLACK = "&H00000000"
 
@@ -102,6 +103,24 @@ class OverlayManager:
         self._player.clear_overlay(_ID_STANDBY)
         self._expiry.pop(_ID_STANDBY, None)
 
+    def show_bug(self) -> None:
+        """Show the configured persistent text network bug, when enabled."""
+        bug = self._config.network_bug
+        if not bug.enabled or not bug.text:
+            self.hide_bug()
+            return
+
+        ass = _network_bug_ass(bug.text, bug.corner, bug.opacity, self._ui)
+        self._player.set_overlay(_ID_BUG, ass, CANVAS_W, CANVAS_H)
+        # A network bug stays up until the app explicitly hides it (for
+        # standby/no-signal), just like the persistent standby overlay.
+        self._expiry.pop(_ID_BUG, None)
+
+    def hide_bug(self) -> None:
+        """Remove the network bug without disturbing any other OSD layer."""
+        self._player.clear_overlay(_ID_BUG)
+        self._expiry.pop(_ID_BUG, None)
+
     def tick(self) -> None:
         """Clear any overlays whose time is up. Call this every loop iteration."""
         now = self._clock()
@@ -111,7 +130,11 @@ class OverlayManager:
                 self._expiry.pop(overlay_id, None)
 
     def clear_all(self) -> None:
-        for overlay_id in (_ID_CHANNEL, _ID_VOLUME, _ID_STANDBY, _ID_MESSAGE):
+        overlay_ids = [_ID_CHANNEL, _ID_VOLUME, _ID_STANDBY, _ID_MESSAGE]
+        # Preserve upstream's exact overlay calls when the feature is disabled.
+        if self._config.network_bug.enabled:
+            overlay_ids.append(_ID_BUG)
+        for overlay_id in overlay_ids:
             self._player.clear_overlay(overlay_id)
         self._expiry.clear()
 
@@ -200,6 +223,24 @@ def _message_ass(text: str, ui: UiConfig) -> str:
 
 def _standby_ass(ui: UiConfig) -> str:
     return rf"{{\an5\pos({_FRAME_CX},{CANVAS_H // 2}){_style(ui, size=72)}}}STANDBY"
+
+
+def _network_bug_ass(text: str, corner: str, opacity: float, ui: UiConfig) -> str:
+    """A small station identifier anchored to a safe corner of the 4:3 picture."""
+    align, x, y = {
+        "top-left": (7, _IX0, _IY0),
+        "top-right": (9, _IX1, _IY0),
+        "bottom-left": (1, _IX0, _IY1),
+        "bottom-right": (3, _IX1, _IY1),
+    }[corner]
+    # ASS alpha is transparency (the inverse of the user-facing opacity):
+    # 00 is fully opaque and FF is fully transparent.
+    alpha = round((1.0 - max(0.0, min(1.0, opacity))) * 255)
+    alpha_tag = rf"\alpha&H{alpha:02X}&"
+    return (
+        rf"{{\an{align}\pos({x},{y}){_style(ui, size=44, alpha=alpha)}"
+        rf"{alpha_tag}}}{_escape(text)}"
+    )
 
 
 def _filled_rect(*, x: float, y: float, w: float, h: float, fill: str) -> str:

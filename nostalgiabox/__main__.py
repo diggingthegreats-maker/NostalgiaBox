@@ -85,6 +85,35 @@ def _list_audio_devices() -> int:
         return 1
 
 
+def _generate_assets(explicit_config: Optional[str]) -> int:
+    """Generate cache-correct filler assets, using config when available."""
+    from .static_gen import DEFAULT_ASSETS_DIR, main as gen_main
+
+    assets_dir = DEFAULT_ASSETS_DIR
+    static_audio = False
+    try:
+        config_path = _find_config(explicit_config)
+    except ConfigError as exc:
+        # Preserve the upstream no-config workflow, but an explicitly requested
+        # missing config is almost certainly a typo and should be reported.
+        if explicit_config:
+            log.error("%s", exc)
+            return 2
+    else:
+        try:
+            config = load_config(config_path)
+        except ConfigError as exc:
+            log.error("%s", exc)
+            return 2
+        assets_dir = config.assets_dir or DEFAULT_ASSETS_DIR
+        static_audio = config.static_audio
+
+    gen_args = ["--assets-dir", str(assets_dir)]
+    if static_audio:
+        gen_args.append("--static-audio")
+    return gen_main(gen_args)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="nostalgiabox",
@@ -95,6 +124,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--dry-run",
         action="store_true",
         help="run without real hardware (mock player + keyboard/stdin control)",
+    )
+    parser.add_argument(
+        "--demo-ends",
+        type=int,
+        default=0,
+        metavar="N",
+        help="with --dry-run, simulate N playback endings and exit",
     )
     parser.add_argument(
         "--check",
@@ -127,9 +163,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if args.generate_assets:
-        from .static_gen import DEFAULT_ASSETS_DIR, main as gen_main
-
-        return gen_main(["--assets-dir", str(DEFAULT_ASSETS_DIR)])
+        return _generate_assets(args.config)
 
     if args.list_audio:
         return _list_audio_devices()
@@ -147,8 +181,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from .app import run_from_config
 
+    if args.demo_ends < 0:
+        log.error("--demo-ends must be >= 0")
+        return 2
+    if args.demo_ends and not args.dry_run:
+        log.error("--demo-ends requires --dry-run")
+        return 2
+
     try:
-        run_from_config(config, dry_run=args.dry_run)
+        run_from_config(
+            config,
+            dry_run=args.dry_run,
+            demo_ends=args.demo_ends,
+        )
     except RuntimeError as exc:
         log.error("%s", exc)
         return 1
